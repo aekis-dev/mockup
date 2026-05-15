@@ -1,4 +1,4 @@
-package docker
+package mockup
 
 import (
 	"context"
@@ -72,7 +72,7 @@ type Mockup struct {
 
 // LoadMockup parses a compose YAML file as a mockup template.
 // Returns an error if the file is not valid YAML or missing a 'services' key.
-func LoadMockup(path string) (*Mockup, error) {
+func Load(path string) (*Mockup, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read mockup %s: %w", path, err)
@@ -80,8 +80,8 @@ func LoadMockup(path string) (*Mockup, error) {
 	return parseMockup(path, data)
 }
 
-// ParseMockup parses raw YAML bytes as a mockup template.
-func ParseMockup(name string, data []byte) (*Mockup, error) {
+// Parse parses raw YAML bytes as a mockup template.
+func Parse(name string, data []byte) (*Mockup, error) {
 	return parseMockup(name, data)
 }
 
