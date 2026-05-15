@@ -1,10 +1,14 @@
 package mockup
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
+	text_template "text/template"
 
 	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/loader"
@@ -64,42 +68,142 @@ func interpolate(node interface{}, m template.Mapping) (interface{}, error) {
 	}
 }
 
-// Mockup holds a parsed and validated compose template with ${VAR} placeholders.
-type Mockup struct {
-	name string
-	raw  map[string]interface{}
+// MergeMapping combines multiple template.Mappings into one — first match wins.
+// Use this to merge a LookupRegistry mapping with your own vars before calling
+// Render or Project.
+func MergeMapping(mappings ...template.Mapping) template.Mapping {
+	return func(key string) (string, bool) {
+		for _, m := range mappings {
+			if v, ok := m(key); ok {
+				return v, ok
+			}
+		}
+		return "", false
+	}
 }
 
-// LoadMockup parses a compose YAML file as a mockup template.
-// Returns an error if the file is not valid YAML or missing a 'services' key.
+// LookupRegistry accumulates runtime values registered during template
+// expansion via {{ lookup .Field }}. Each value gets a generated key emitted
+// as a ${__LOOKUP_N__} placeholder in the YAML output, resolved by
+// interpolate() in phase 2 via the Mapping it exposes.
+type LookupRegistry struct {
+	mu      sync.Mutex
+	entries map[string]string
+	counter atomic.Int64
+}
+
+// NewLookupRegistry returns an empty registry ready for use.
+func NewLookupRegistry() *LookupRegistry {
+	return &LookupRegistry{entries: make(map[string]string)}
+}
+
+// register stores value under a generated key and returns the ${KEY}
+// placeholder string to be emitted into the YAML.
+func (r *LookupRegistry) register(value string) string {
+	key := fmt.Sprintf("__LOOKUP_%d__", r.counter.Add(1)-1)
+	r.mu.Lock()
+	r.entries[key] = value
+	r.mu.Unlock()
+	return "${" + key + "}"
+}
+
+// Mapping returns a compose-go template.Mapping that resolves all registered
+// lookup keys. Pass this to MergeMapping alongside your own vars.
+func (r *LookupRegistry) Mapping() template.Mapping {
+	r.mu.Lock()
+	snapshot := make(map[string]string, len(r.entries))
+	for k, v := range r.entries {
+		snapshot[k] = v
+	}
+	r.mu.Unlock()
+	return func(key string) (string, bool) {
+		v, ok := snapshot[key]
+		return v, ok
+	}
+}
+
+// funcMap provides the template functions available to all mockups.
+//
+//   - placeholder "VAR" — emits ${VAR}; use when the var name is a literal
+//     known at template-write time.
+//   - lookup is registered as a no-op stub so templates parse without error
+//     before Expand binds the real registry-backed implementation.
+var funcMap = text_template.FuncMap{
+	"placeholder": func(name string) string { return "${" + name + "}" },
+	"lookup":      func(value string) string { return value },
+}
+
+// Mockup holds a parsed compose mockup. Every mockup is backed by a
+// text/template regardless of whether it uses dynamic directives, so plain
+// YAML files and template files are handled identically.
+//
+// Two-phase rendering:
+//  1. Expand executes the text/template with Go data and a LookupRegistry,
+//     producing YAML that still contains ${VAR} placeholders.
+//     {{ placeholder "VAR" }} emits ${VAR} for vars known at write time.
+//     {{ lookup .Field }} registers a runtime value and emits ${__LOOKUP_N__}.
+//  2. Render / Project substitutes all ${VAR} placeholders — including any
+//     ${__LOOKUP_N__} keys — via interpolate(), covering both keys and values.
+type Mockup struct {
+	name string
+	tmpl *text_template.Template
+	raw  map[string]interface{} // populated by Expand
+}
+
+// Load parses a file as a Mockup.
 func Load(path string) (*Mockup, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read mockup %s: %w", path, err)
 	}
-	return parseMockup(path, data)
+	return Parse(filepath.Base(path), data)
 }
 
-// Parse parses raw YAML bytes as a mockup template.
+// Parse parses raw bytes as a Mockup.
 func Parse(name string, data []byte) (*Mockup, error) {
-	return parseMockup(name, data)
-}
-
-func parseMockup(name string, data []byte) (*Mockup, error) {
-	var raw map[string]interface{}
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	tmpl, err := text_template.New(name).Funcs(funcMap).Parse(string(data))
+	if err != nil {
 		return nil, fmt.Errorf("parse mockup %s: %w", name, err)
 	}
-	if _, ok := raw["services"]; !ok {
-		return nil, fmt.Errorf("mockup %s missing top-level 'services' key", name)
+	return &Mockup{name: name, tmpl: tmpl}, nil
+}
+
+// Expand executes the template with data, wiring {{ lookup }} to register
+// values into reg, and parses the resulting YAML into m.raw — making the
+// mockup ready for Render or Project.
+// For mockups with no dynamic directives or lookup calls, pass nil as data
+// and a fresh NewLookupRegistry().
+func (m *Mockup) Expand(data any, reg *LookupRegistry) error {
+	// Clone so the base template is not mutated across concurrent expansions.
+	tmpl, err := m.tmpl.Clone()
+	if err != nil {
+		return fmt.Errorf("clone mockup %s: %w", m.name, err)
 	}
-	return &Mockup{name: name, raw: raw}, nil
+	tmpl.Funcs(text_template.FuncMap{
+		"lookup": reg.register,
+	})
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return fmt.Errorf("expand mockup %s: %w", m.name, err)
+	}
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(buf.Bytes(), &raw); err != nil {
+		return fmt.Errorf("parse expanded mockup %s: %w", m.name, err)
+	}
+	if _, ok := raw["services"]; !ok {
+		return fmt.Errorf("mockup %s missing top-level 'services' key", m.name)
+	}
+	m.raw = raw
+	return nil
 }
 
 // Render substitutes vars into the mockup — both keys and values — and
 // returns the resulting map. Multi-line string values like PEM certs are
 // preserved correctly since they remain as Go strings throughout.
 func (m *Mockup) Render(mapping template.Mapping) (map[string]interface{}, error) {
+	if m.raw == nil {
+		return nil, fmt.Errorf("mockup %s: Render called before Expand", m.name)
+	}
 	result, err := interpolate(m.raw, mapping)
 	if err != nil {
 		return nil, fmt.Errorf("render mockup %s: %w", m.name, err)
