@@ -14,9 +14,6 @@ import (
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/template"
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/client"
 	"gopkg.in/yaml.v3"
 )
 
@@ -68,38 +65,42 @@ func interpolate(node interface{}, m template.Mapping) (interface{}, error) {
 	}
 }
 
-// MergeMapping combines multiple template.Mappings into one — first match wins.
-// Use this to merge a LookupRegistry mapping with your own vars before calling
-// Render or Project.
-func MergeMapping(mappings ...template.Mapping) template.Mapping {
+// toMapping derives a compose-go template.Mapping from vars and a registry.
+// Registry keys take priority so __LOOKUP_N__ always resolves.
+// Only string values in vars are resolvable; non-string values are used
+// exclusively by text/template via dot-access and skipped here.
+func toMapping(vars map[string]interface{}, reg *lookupRegistry) template.Mapping {
 	return func(key string) (string, bool) {
-		for _, m := range mappings {
-			if v, ok := m(key); ok {
-				return v, ok
+		if v, ok := reg.entries[key]; ok {
+			return v, true
+		}
+		if v, ok := vars[key]; ok {
+			if s, ok := v.(string); ok {
+				return s, true
 			}
 		}
 		return "", false
 	}
 }
 
-// LookupRegistry accumulates runtime values registered during template
+// lookupRegistry accumulates runtime values registered during template
 // expansion via {{ lookup .Field }}. Each value gets a generated key emitted
-// as a ${__LOOKUP_N__} placeholder in the YAML output, resolved by
-// interpolate() in phase 2 via the Mapping it exposes.
-type LookupRegistry struct {
+// as a ${__LOOKUP_N__} placeholder in the YAML output, resolved in phase 2
+// via toMapping.
+type lookupRegistry struct {
 	mu      sync.Mutex
 	entries map[string]string
 	counter atomic.Int64
 }
 
-// NewLookupRegistry returns an empty registry ready for use.
-func NewLookupRegistry() *LookupRegistry {
-	return &LookupRegistry{entries: make(map[string]string)}
+// newLookupRegistry returns an empty registry ready for use.
+func newLookupRegistry() *lookupRegistry {
+	return &lookupRegistry{entries: make(map[string]string)}
 }
 
 // register stores value under a generated key and returns the ${KEY}
 // placeholder string to be emitted into the YAML.
-func (r *LookupRegistry) register(value string) string {
+func (r *lookupRegistry) register(value string) string {
 	key := fmt.Sprintf("__LOOKUP_%d__", r.counter.Add(1)-1)
 	r.mu.Lock()
 	r.entries[key] = value
@@ -107,27 +108,12 @@ func (r *LookupRegistry) register(value string) string {
 	return "${" + key + "}"
 }
 
-// Mapping returns a compose-go template.Mapping that resolves all registered
-// lookup keys. Pass this to MergeMapping alongside your own vars.
-func (r *LookupRegistry) Mapping() template.Mapping {
-	r.mu.Lock()
-	snapshot := make(map[string]string, len(r.entries))
-	for k, v := range r.entries {
-		snapshot[k] = v
-	}
-	r.mu.Unlock()
-	return func(key string) (string, bool) {
-		v, ok := snapshot[key]
-		return v, ok
-	}
-}
-
 // funcMap provides the template functions available to all mockups.
 //
 //   - placeholder "VAR" — emits ${VAR}; use when the var name is a literal
 //     known at template-write time.
 //   - lookup is registered as a no-op stub so templates parse without error
-//     before Expand binds the real registry-backed implementation.
+//     before Render binds the real registry-backed implementation.
 var funcMap = text_template.FuncMap{
 	"placeholder": func(name string) string { return "${" + name + "}" },
 	"lookup":      func(value string) string { return value },
@@ -137,17 +123,17 @@ var funcMap = text_template.FuncMap{
 // text/template regardless of whether it uses dynamic directives, so plain
 // YAML files and template files are handled identically.
 //
-// Two-phase rendering:
-//  1. Expand executes the text/template with Go data and a LookupRegistry,
-//     producing YAML that still contains ${VAR} placeholders.
+// Two-phase rendering happens automatically inside Render / Project:
+//  1. The text/template is executed with vars as dot-accessible data.
+//     {{ .Field }} accesses any value by key, including non-strings.
 //     {{ placeholder "VAR" }} emits ${VAR} for vars known at write time.
 //     {{ lookup .Field }} registers a runtime value and emits ${__LOOKUP_N__}.
-//  2. Render / Project substitutes all ${VAR} placeholders — including any
-//     ${__LOOKUP_N__} keys — via interpolate(), covering both keys and values.
+//  2. interpolate() substitutes all ${VAR} placeholders — including any
+//     ${__LOOKUP_N__} keys — covering both keys and values.
+//     Only string values in vars participate in interpolation.
 type Mockup struct {
 	name string
 	tmpl *text_template.Template
-	raw  map[string]interface{} // populated by Expand
 }
 
 // Load parses a file as a Mockup.
@@ -168,43 +154,38 @@ func Parse(name string, data []byte) (*Mockup, error) {
 	return &Mockup{name: name, tmpl: tmpl}, nil
 }
 
-// Expand executes the template with data, wiring {{ lookup }} to register
-// values into reg, and parses the resulting YAML into m.raw — making the
-// mockup ready for Render or Project.
-// For mockups with no dynamic directives or lookup calls, pass nil as data
-// and a fresh NewLookupRegistry().
-func (m *Mockup) Expand(data any, reg *LookupRegistry) error {
-	// Clone so the base template is not mutated across concurrent expansions.
+// Render executes the template with vars, then substitutes all ${VAR}
+// placeholders — including any {{ lookup }} values registered during
+// execution — in both keys and values.
+// vars serves dual purpose: non-string values are accessed via {{ .Field }}
+// in the template; string values are also substituted via ${VAR} in phase 2.
+// For mockups with no dynamic directives, pass nil.
+func (m *Mockup) Render(vars map[string]interface{}) (map[string]interface{}, error) {
+	// Phase 1 — execute the template with vars as dot-accessible data.
+	// Clone so the base template is not mutated across concurrent renders.
+	reg := newLookupRegistry()
 	tmpl, err := m.tmpl.Clone()
 	if err != nil {
-		return fmt.Errorf("clone mockup %s: %w", m.name, err)
+		return nil, fmt.Errorf("clone mockup %s: %w", m.name, err)
 	}
 	tmpl.Funcs(text_template.FuncMap{
 		"lookup": reg.register,
 	})
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return fmt.Errorf("expand mockup %s: %w", m.name, err)
+	if err := tmpl.Execute(&buf, vars); err != nil {
+		return nil, fmt.Errorf("expand mockup %s: %w", m.name, err)
 	}
 	var raw map[string]interface{}
 	if err := yaml.Unmarshal(buf.Bytes(), &raw); err != nil {
-		return fmt.Errorf("parse expanded mockup %s: %w", m.name, err)
+		return nil, fmt.Errorf("parse expanded mockup %s: %w", m.name, err)
 	}
 	if _, ok := raw["services"]; !ok {
-		return fmt.Errorf("mockup %s missing top-level 'services' key", m.name)
+		return nil, fmt.Errorf("mockup %s missing top-level 'services' key", m.name)
 	}
-	m.raw = raw
-	return nil
-}
 
-// Render substitutes vars into the mockup — both keys and values — and
-// returns the resulting map. Multi-line string values like PEM certs are
-// preserved correctly since they remain as Go strings throughout.
-func (m *Mockup) Render(mapping template.Mapping) (map[string]interface{}, error) {
-	if m.raw == nil {
-		return nil, fmt.Errorf("mockup %s: Render called before Expand", m.name)
-	}
-	result, err := interpolate(m.raw, mapping)
+	// Phase 2 — interpolate ${VAR} placeholders using string values from vars
+	// and all registered __LOOKUP_N__ keys from the registry.
+	result, err := interpolate(raw, toMapping(vars, reg))
 	if err != nil {
 		return nil, fmt.Errorf("render mockup %s: %w", m.name, err)
 	}
@@ -215,17 +196,18 @@ func (m *Mockup) Render(mapping template.Mapping) (map[string]interface{}, error
 	return rendered, nil
 }
 
-// Project renders the mockup, loads it in-memory via loader.LoadWithContext,
-// writes the canonical compose.yaml once to <dir>/<composeName>/compose.yaml,
-// then reloads from that stable path for the compose SDK.
-func (m *Mockup) Project(goCtx context.Context, dir string, mapping template.Mapping) (*types.Project, error) {
-	composeName, _ := mapping("COMPOSE_NAME")
+// Project renders the mockup with vars (see Render), loads it in-memory via
+// loader.LoadWithContext, writes the canonical compose.yaml once to
+// <dir>/<composeName>/compose.yaml, then reloads from that stable path for
+// the compose SDK. vars must contain a string key "COMPOSE_NAME".
+func (m *Mockup) Project(goCtx context.Context, dir string, vars map[string]interface{}) (*types.Project, error) {
+	composeName, _ := vars["COMPOSE_NAME"].(string)
 	if composeName == "" {
 		return nil, fmt.Errorf("mockup %s: COMPOSE_NAME var is required", m.name)
 	}
 
-	// Step 1 — render: interpolate both keys and values in memory
-	rendered, err := m.Render(mapping)
+	// Step 1 — render: expand template and interpolate both keys and values
+	rendered, err := m.Render(vars)
 	if err != nil {
 		return nil, err
 	}
@@ -299,33 +281,4 @@ func (m *Mockup) Project(goCtx context.Context, dir string, mapping template.Map
 	}
 
 	return project, nil
-}
-
-// StartCompose starts all containers belonging to a compose project by label.
-// Used as a replacement for the compose SDK's Start which has issues finding
-// containers that were just created via compose Create.
-func StartCompose(ctx context.Context, docker *client.Client, projectName string) error {
-	f := filters.NewArgs()
-	f.Add("label", "com.docker.compose.project="+projectName)
-
-	list, err := docker.ContainerList(ctx, container.ListOptions{
-		All:     true,
-		Filters: f,
-	})
-	if err != nil {
-		return fmt.Errorf("list compose containers for %s: %w", projectName, err)
-	}
-	if len(list) == 0 {
-		return fmt.Errorf("no containers found for compose project %s", projectName)
-	}
-
-	for _, ct := range list {
-		if ct.State == "running" {
-			continue
-		}
-		if err := docker.ContainerStart(ctx, ct.ID, container.StartOptions{}); err != nil {
-			return fmt.Errorf("start container %s: %w", ct.ID[:12], err)
-		}
-	}
-	return nil
 }

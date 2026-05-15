@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/aekis-dev/mockup"
-	"github.com/compose-spec/compose-go/v2/template"
 )
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -22,20 +21,14 @@ func mustParse(t *testing.T, name string, data []byte) *mockup.Mockup {
 	return m
 }
 
-// mustExpand calls Expand and fails the test on error.
-func mustExpand(t *testing.T, m *mockup.Mockup, data any, reg *mockup.LookupRegistry) {
+// mustRender calls Render and fails the test on error.
+func mustRender(t *testing.T, m *mockup.Mockup, vars map[string]interface{}) map[string]interface{} {
 	t.Helper()
-	if err := m.Expand(data, reg); err != nil {
-		t.Fatalf("Expand: unexpected error: %v", err)
+	rendered, err := m.Render(vars)
+	if err != nil {
+		t.Fatalf("Render: unexpected error: %v", err)
 	}
-}
-
-// staticMapping returns a template.Mapping backed by a plain map.
-func staticMapping(vars map[string]string) template.Mapping {
-	return func(key string) (string, bool) {
-		v, ok := vars[key]
-		return v, ok
-	}
+	return rendered
 }
 
 // minimalYAML is the smallest valid mockup — one service, no placeholders.
@@ -58,20 +51,19 @@ func TestParse_ValidYAML(t *testing.T) {
 }
 
 func TestParse_MissingServicesKey(t *testing.T) {
+	// Parse itself does not validate services — Render does.
+	// So Parse should succeed; Render should fail.
 	yaml := []byte(`
 name: myapp
 networks:
   default:
     external: true
 `)
-	// Parse itself does not validate services — Expand does.
-	// So Parse should succeed; Expand should fail.
 	m, err := mockup.Parse("test", yaml)
 	if err != nil {
 		t.Fatalf("Parse: unexpected error: %v", err)
 	}
-	reg := mockup.NewLookupRegistry()
-	err = m.Expand(nil, reg)
+	_, err = m.Render(nil)
 	if err == nil {
 		t.Fatal("expected error for missing 'services' key, got nil")
 	}
@@ -91,8 +83,7 @@ services:
 	if err != nil {
 		t.Fatalf("Parse: unexpected error: %v", err)
 	}
-	reg := mockup.NewLookupRegistry()
-	err = m.Expand(nil, reg)
+	_, err = m.Render(nil)
 	if err == nil {
 		t.Fatal("expected error for invalid YAML, got nil")
 	}
@@ -139,19 +130,14 @@ func TestLoad_MissingFile(t *testing.T) {
 	}
 }
 
-// ─── Expand ───────────────────────────────────────────────────────────────────
+// ─── Render ───────────────────────────────────────────────────────────────────
 
-func TestExpand_PlainYAMLPassthrough(t *testing.T) {
-	// Plain YAML with no template directives — Expand with nil data should
-	// parse cleanly and populate raw.
+func TestRender_PlainYAMLPassthrough(t *testing.T) {
+	// Plain YAML with no template directives — Render with nil vars should
+	// parse cleanly and return the service map unchanged.
 	m := mustParse(t, "test", []byte(minimalYAML))
-	reg := mockup.NewLookupRegistry()
-	mustExpand(t, m, nil, reg)
+	rendered := mustRender(t, m, nil)
 
-	rendered, err := m.Render(staticMapping(nil))
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
 	services, ok := rendered["services"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected services map, got %T", rendered["services"])
@@ -161,7 +147,7 @@ func TestExpand_PlainYAMLPassthrough(t *testing.T) {
 	}
 }
 
-func TestExpand_TemplateWithData(t *testing.T) {
+func TestRender_TemplateWithData(t *testing.T) {
 	yaml := []byte(`
 services:
 {{ range .Services }}
@@ -170,21 +156,14 @@ services:
 {{ end }}
 `)
 	type svc struct{ Name, Image string }
-	type data struct{ Services []svc }
 
-	m := mustParse(t, "test", yaml)
-	reg := mockup.NewLookupRegistry()
-	mustExpand(t, m, data{
-		Services: []svc{
+	rendered := mustRender(t, mustParse(t, "test", yaml), map[string]interface{}{
+		"Services": []svc{
 			{Name: "alpha", Image: "alpine:3"},
 			{Name: "beta", Image: "nginx:latest"},
 		},
-	}, reg)
+	})
 
-	rendered, err := m.Render(staticMapping(nil))
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
 	services, ok := rendered["services"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected services map, got %T", rendered["services"])
@@ -196,34 +175,27 @@ services:
 	}
 }
 
-func TestExpand_Placeholder(t *testing.T) {
-	// {{ placeholder "VAR" }} must survive Expand as ${VAR} for phase-2
-	// interpolation.
+func TestRender_Placeholder(t *testing.T) {
+	// {{ placeholder "VAR" }} must survive phase 1 as ${VAR} and be
+	// substituted in phase 2 via the string value in vars.
 	yaml := []byte(`
 services:
   app:
     image: {{ placeholder "IMAGE" }}
 `)
-	m := mustParse(t, "test", yaml)
-	reg := mockup.NewLookupRegistry()
-	mustExpand(t, m, nil, reg)
-
-	// Render with the var resolved — should see the substituted value.
-	rendered, err := m.Render(staticMapping(map[string]string{
+	rendered := mustRender(t, mustParse(t, "test", yaml), map[string]interface{}{
 		"IMAGE": "alpine:edge",
-	}))
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
+	})
+
 	svc := rendered["services"].(map[string]interface{})["app"].(map[string]interface{})
 	if svc["image"] != "alpine:edge" {
 		t.Errorf("expected image 'alpine:edge', got %v", svc["image"])
 	}
 }
 
-func TestExpand_LookupRegistersValue(t *testing.T) {
-	// {{ lookup .Secret }} must register the runtime value and emit a
-	// ${__LOOKUP_N__} placeholder that resolves via reg.Mapping().
+func TestRender_LookupRegistersValue(t *testing.T) {
+	// {{ lookup .Secret }} must register the runtime value and resolve it
+	// transparently in phase 2 without any caller involvement.
 	yaml := []byte(`
 services:
   app:
@@ -231,26 +203,19 @@ services:
     environment:
       SECRET: {{ lookup .Secret }}
 `)
-	type data struct{ Secret string }
+	rendered := mustRender(t, mustParse(t, "test", yaml), map[string]interface{}{
+		"Secret": "s3cr3t-value",
+	})
 
-	m := mustParse(t, "test", yaml)
-	reg := mockup.NewLookupRegistry()
-	mustExpand(t, m, data{Secret: "s3cr3t-value"}, reg)
-
-	mapping := mockup.MergeMapping(reg.Mapping(), staticMapping(nil))
-	rendered, err := m.Render(mapping)
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
-	svc := rendered["services"].(map[string]interface{})["app"].(map[string]interface{})
-	env := svc["environment"].(map[string]interface{})
+	env := rendered["services"].(map[string]interface{})["app"].(map[string]interface{})["environment"].(map[string]interface{})
 	if env["SECRET"] != "s3cr3t-value" {
 		t.Errorf("expected SECRET 's3cr3t-value', got %v", env["SECRET"])
 	}
 }
 
-func TestExpand_MultipleLookupKeys(t *testing.T) {
-	// Each {{ lookup }} call must produce a distinct __LOOKUP_N__ key.
+func TestRender_MultipleLookupKeys(t *testing.T) {
+	// Each {{ lookup }} call must produce a distinct __LOOKUP_N__ key and
+	// both must resolve correctly in phase 2.
 	yaml := []byte(`
 services:
   app:
@@ -259,36 +224,17 @@ services:
       CERT: {{ lookup .Cert }}
       KEY: {{ lookup .Key }}
 `)
-	type data struct{ Cert, Key string }
+	rendered := mustRender(t, mustParse(t, "test", yaml), map[string]interface{}{
+		"Cert": "cert-pem",
+		"Key":  "key-pem",
+	})
 
-	m := mustParse(t, "test", yaml)
-	reg := mockup.NewLookupRegistry()
-	mustExpand(t, m, data{Cert: "cert-pem", Key: "key-pem"}, reg)
-
-	mapping := mockup.MergeMapping(reg.Mapping(), staticMapping(nil))
-	rendered, err := m.Render(mapping)
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
 	env := rendered["services"].(map[string]interface{})["app"].(map[string]interface{})["environment"].(map[string]interface{})
 	if env["CERT"] != "cert-pem" {
 		t.Errorf("expected CERT 'cert-pem', got %v", env["CERT"])
 	}
 	if env["KEY"] != "key-pem" {
 		t.Errorf("expected KEY 'key-pem', got %v", env["KEY"])
-	}
-}
-
-// ─── Render ───────────────────────────────────────────────────────────────────
-
-func TestRender_BeforeExpand(t *testing.T) {
-	m := mustParse(t, "test", []byte(minimalYAML))
-	_, err := m.Render(staticMapping(nil))
-	if err == nil {
-		t.Fatal("expected error when Render called before Expand, got nil")
-	}
-	if !strings.Contains(err.Error(), "Render called before Expand") {
-		t.Errorf("unexpected error message: %v", err)
 	}
 }
 
@@ -299,16 +245,11 @@ services:
     image: ${IMAGE}
     restart: ${RESTART}
 `)
-	m := mustParse(t, "test", yaml)
-	mustExpand(t, m, nil, mockup.NewLookupRegistry())
-
-	rendered, err := m.Render(staticMapping(map[string]string{
+	rendered := mustRender(t, mustParse(t, "test", yaml), map[string]interface{}{
 		"IMAGE":   "alpine:3",
 		"RESTART": "always",
-	}))
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
+	})
+
 	svc := rendered["services"].(map[string]interface{})["app"].(map[string]interface{})
 	if svc["image"] != "alpine:3" {
 		t.Errorf("expected image 'alpine:3', got %v", svc["image"])
@@ -329,15 +270,10 @@ configs:
     name: ${CONFIG_NAME}
     content: hello
 `)
-	m := mustParse(t, "test", yaml)
-	mustExpand(t, m, nil, mockup.NewLookupRegistry())
-
-	rendered, err := m.Render(staticMapping(map[string]string{
+	rendered := mustRender(t, mustParse(t, "test", yaml), map[string]interface{}{
 		"CONFIG_NAME": "my-config",
-	}))
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
+	})
+
 	configs, ok := rendered["configs"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("expected configs map, got %T", rendered["configs"])
@@ -347,9 +283,9 @@ configs:
 	}
 }
 
-func TestRender_LookupResolvesViaMergeMapping(t *testing.T) {
-	// End-to-end: lookup registers a value during Expand; reg.Mapping()
-	// merged with static vars resolves both during Render.
+func TestRender_LookupAndVarsTogether(t *testing.T) {
+	// End-to-end: string vars resolve via ${VAR}, non-string vars feed the
+	// template, and {{ lookup }} values are registered and resolved internally.
 	yaml := []byte(`
 services:
   app:
@@ -357,19 +293,11 @@ services:
     environment:
       CA: {{ lookup .CA }}
 `)
-	type data struct{ CA string }
-
-	m := mustParse(t, "test", yaml)
-	reg := mockup.NewLookupRegistry()
-	mustExpand(t, m, data{CA: "-----BEGIN CERTIFICATE-----\n..."}, reg)
-
-	mapping := mockup.MergeMapping(reg.Mapping(), staticMapping(map[string]string{
+	rendered := mustRender(t, mustParse(t, "test", yaml), map[string]interface{}{
 		"IMAGE": "alpine:3",
-	}))
-	rendered, err := m.Render(mapping)
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
+		"CA":    "-----BEGIN CERTIFICATE-----\n...",
+	})
+
 	svc := rendered["services"].(map[string]interface{})["app"].(map[string]interface{})
 	if svc["image"] != "alpine:3" {
 		t.Errorf("expected image 'alpine:3', got %v", svc["image"])
@@ -380,46 +308,18 @@ services:
 	}
 }
 
-func TestRender_MissingVar_LeavesPlaceholder(t *testing.T) {
-	// compose-go's template.Substitute leaves ${MISSING} as-is when the
-	// mapping returns false — no error, just unresolved placeholder.
+func TestRender_MissingVar_LeavesEmpty(t *testing.T) {
+	// compose-go's template.Substitute resolves unknown vars to an empty
+	// string — no error, just unresolved placeholder becomes "".
 	yaml := []byte(`
 services:
   app:
     image: ${MISSING}
 `)
-	m := mustParse(t, "test", yaml)
-	mustExpand(t, m, nil, mockup.NewLookupRegistry())
+	rendered := mustRender(t, mustParse(t, "test", yaml), nil)
 
-	rendered, err := m.Render(staticMapping(nil))
-	if err != nil {
-		t.Fatalf("Render: unexpected error: %v", err)
-	}
 	svc := rendered["services"].(map[string]interface{})["app"].(map[string]interface{})
-	// The placeholder is left as an empty string by compose-go when unresolved.
 	if svc["image"] != "" {
 		t.Errorf("expected empty string for unresolved var, got %v", svc["image"])
-	}
-}
-
-// ─── MergeMapping ─────────────────────────────────────────────────────────────
-
-func TestMergeMapping_FirstMatchWins(t *testing.T) {
-	first := staticMapping(map[string]string{"X": "from-first"})
-	second := staticMapping(map[string]string{"X": "from-second", "Y": "from-second"})
-	merged := mockup.MergeMapping(first, second)
-
-	if v, ok := merged("X"); !ok || v != "from-first" {
-		t.Errorf("expected 'from-first', got %q (ok=%v)", v, ok)
-	}
-	if v, ok := merged("Y"); !ok || v != "from-second" {
-		t.Errorf("expected 'from-second', got %q (ok=%v)", v, ok)
-	}
-}
-
-func TestMergeMapping_AllMiss(t *testing.T) {
-	merged := mockup.MergeMapping(staticMapping(nil), staticMapping(nil))
-	if _, ok := merged("NOPE"); ok {
-		t.Error("expected ok=false for missing key")
 	}
 }
